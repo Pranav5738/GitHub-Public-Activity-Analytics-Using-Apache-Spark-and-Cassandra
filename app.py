@@ -10,7 +10,7 @@ from collections import Counter
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 import zipfile
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -55,6 +55,7 @@ PLOTLY_CONFIG = {"displaylogo": False, "responsive": True}
 DATASET_ID = "current"
 GITHUB_EVENTS_URL = "https://api.github.com/events?per_page=100&page=1"
 LIVE_EVENT_LIMIT = 1000
+LIVE_EVENT_DATASET_ID = "live_public"
 
 
 st.set_page_config(
@@ -531,7 +532,7 @@ def fetch_live_public_events(etag: str | None) -> tuple[list[dict[str, Any]], st
         raise RuntimeError(f"Could not reach GitHub: {reason}") from None
 
 
-def describe_live_event(event: dict[str, Any]) -> dict[str, str]:
+def describe_live_event(event: dict[str, Any]) -> dict[str, Any]:
     """Select safe, readable fields from one public event payload."""
     event_type = str(event.get("type") or "UnknownEvent")
     payload = event.get("payload") or {}
@@ -553,22 +554,151 @@ def describe_live_event(event: dict[str, Any]) -> dict[str, str]:
             detail = f"{detail + ' · ' if detail else ''}{' — '.join(parts)}"
 
     try:
-        parsed = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(created_at.replace("Z", "+00:00")).astimezone(timezone.utc)
         created_at = parsed.strftime("%Y-%m-%d %H:%M:%S UTC")
+        event_date = parsed.date()
+        created_at_dt = parsed.replace(tzinfo=None)
     except ValueError:
-        pass
+        event_date = None
+        created_at_dt = None
     return {
         "id": str(event.get("id") or ""),
         "time": created_at,
+        "event_date": event_date,
+        "created_at_dt": created_at_dt,
         "event_type": event_type,
         "repository": str(repository),
         "actor": str(actor),
         "detail": detail or "—",
+        "payload": json.dumps(event, ensure_ascii=True, separators=(",", ":")),
     }
 
 
+def persist_live_events(session: Any, events: list[dict[str, Any]]) -> None:
+    """Upsert public events by ID into Cassandra; repeated API pages are idempotent."""
+    statement = session.prepare(
+        "INSERT INTO live_events_by_day "
+        "(dataset_id, event_date, created_at, event_id, event_type, repository, actor, detail, payload, observed_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+    observed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    for event in events:
+        row = describe_live_event(event)
+        if not row["id"] or row["event_date"] is None or row["created_at_dt"] is None:
+            continue
+        session.execute(
+            statement,
+            (
+                LIVE_EVENT_DATASET_ID,
+                row["event_date"],
+                row["created_at_dt"],
+                row["id"],
+                row["event_type"],
+                row["repository"],
+                row["actor"],
+                row["detail"],
+                row["payload"],
+                observed_at,
+            ),
+        )
+
+
+def load_persisted_live_events(session: Any, days: int = 7) -> list[dict[str, Any]]:
+    """Load recent event partitions so live history survives a browser session."""
+    statement = session.prepare(
+        "SELECT event_id, created_at, event_type, repository, actor, detail "
+        "FROM live_events_by_day WHERE dataset_id = ? AND event_date = ?"
+    )
+    today = datetime.now(timezone.utc).date()
+    rows: list[dict[str, Any]] = []
+    for offset in range(days):
+        event_date = today - timedelta(days=offset)
+        for record in session.execute(statement, (LIVE_EVENT_DATASET_ID, event_date)):
+            created = record.created_at
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            else:
+                created = created.astimezone(timezone.utc)
+            rows.append({
+                "id": record.event_id,
+                "time": created.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "event_date": event_date,
+                "created_at_dt": created.replace(tzinfo=None),
+                "event_type": record.event_type or "UnknownEvent",
+                "repository": record.repository or "Unknown repository",
+                "actor": record.actor or "Unknown actor",
+                "detail": record.detail or "—",
+            })
+    rows.sort(key=lambda row: row["created_at_dt"], reverse=True)
+    return rows
+
+
+def render_persistent_dashboard() -> None:
+    """Read retained Cassandra events; collection runs separately in live_collector.py."""
+    st.markdown(
+        '<div class="hero"><div class="eyebrow">GitHub public events · live</div>'
+        '<h1>GitHub Public Activity Analytics</h1>'
+        '<p>New events are collected in the background and retained in Cassandra.</p></div>',
+        unsafe_allow_html=True,
+    )
+    st.info("GitHub's public Events API is delayed and rate limited. This dashboard shows observed events, not a complete global feed.")
+    config = cassandra_config()
+    if not config["contact_points"] or config["port"] is None or not 1 <= config["port"] <= 65535:
+        st.error("Configure CASSANDRA_CONTACT_POINTS and a valid CASSANDRA_PORT to read saved events.")
+        return
+    if bool(config["username"]) != bool(config["password"]):
+        st.error("Set both CASSANDRA_USERNAME and CASSANDRA_PASSWORD, or leave both unset.")
+        return
+    try:
+        session = cassandra_session(
+            tuple(config["contact_points"]), config["port"], config["keyspace"],
+            config["username"], config["password"], config["secure_connect_bundle"],
+        )
+        rows = load_persisted_live_events(session, days=30)
+    except Exception as exc:
+        st.error(f"Could not load stored events from Cassandra: {exc}")
+        return
+    if not rows:
+        st.warning("No events have been collected yet. Start live_collector.py and refresh shortly.")
+        return
+
+    event_counts = Counter(row["event_type"] for row in rows)
+    repo_counts = Counter(row["repository"] for row in rows)
+    developer_counts = Counter(row["actor"] for row in rows)
+    st.caption("Showing the last 30 days of observed Cassandra history. Stored events have no automatic expiry.")
+    metrics = st.columns(4)
+    metrics[0].metric("Stored events", format_number(len(rows)))
+    metrics[1].metric("Event types", format_number(len(event_counts)))
+    metrics[2].metric("Active repositories", format_number(len(repo_counts)))
+    metrics[3].metric("Active developers", format_number(len(developer_counts)))
+
+    left, right = st.columns(2)
+    event_frame = pd.DataFrame(event_counts.most_common(), columns=["Event type", "Events"])
+    event_chart = px.bar(event_frame.sort_values("Events"), x="Events", y="Event type", orientation="h")
+    left.markdown("### Event types")
+    left.plotly_chart(event_chart, width="stretch", config=PLOTLY_CONFIG)
+    daily_counts = Counter(row["event_date"] for row in rows if row.get("event_date"))
+    daily_frame = pd.DataFrame(sorted(daily_counts.items()), columns=["Date", "Events"])
+    right.markdown("### Historical activity")
+    right.plotly_chart(px.line(daily_frame, x="Date", y="Events", markers=True), width="stretch", config=PLOTLY_CONFIG)
+
+    c1, c2 = st.columns(2)
+    c1.markdown("### Active repositories")
+    c1.dataframe(pd.DataFrame(repo_counts.most_common(10), columns=["Repository", "Events"]), width="stretch", hide_index=True)
+    c2.markdown("### Active developers")
+    c2.dataframe(pd.DataFrame(developer_counts.most_common(10), columns=["Developer", "Events"]), width="stretch", hide_index=True)
+    st.markdown("### Recent events")
+    recent = pd.DataFrame(rows[:100]).rename(columns={
+        "time": "Time (UTC)", "event_type": "Event type", "repository": "Repository",
+        "actor": "Developer", "detail": "Details", "id": "Event ID",
+    })
+    st.dataframe(recent[["Time (UTC)", "Event type", "Repository", "Developer", "Details", "Event ID"]], width="stretch", hide_index=True)
+    st.download_button("Download displayed event history (CSV)", recent.to_csv(index=False).encode("utf-8"),
+                       file_name="github_live_events.csv", mime="text/csv")
+
+
 def render_live_dashboard() -> None:
-    """Poll and display the latest public events for this Streamlit session."""
+    """Poll GitHub and display recent events persisted in Cassandra."""
     st.markdown(
         '<div class="hero"><div class="eyebrow">Live view · GitHub public events</div>'
         '<h1>Live GitHub Activity</h1>'
@@ -577,7 +707,7 @@ def render_live_dashboard() -> None:
     )
     st.info(
         "GitHub's public Events API is delayed and rate limited. This view refreshes at the allowed polling interval; "
-        "it is near real time, not a complete or instantaneous feed. Events are kept only in this browser session."
+        "it is near real time, not a complete or instantaneous feed."
     )
 
     st.session_state.setdefault("live_event_log", {})
@@ -587,6 +717,29 @@ def render_live_dashboard() -> None:
     st.session_state.setdefault("live_error", None)
     st.session_state.setdefault("live_new_event_count", 0)
     st.session_state.setdefault("live_initialized", False)
+    st.session_state.setdefault("live_storage_error", None)
+
+    config = cassandra_config()
+    live_session = None
+    if config["secure_connect_bundle"] or config["contact_points"]:
+        if config["port"] is None or not 1 <= config["port"] <= 65535:
+            st.session_state.live_storage_error = "CASSANDRA_PORT must be an integer from 1 through 65535."
+        elif bool(config["username"]) != bool(config["password"]):
+            st.session_state.live_storage_error = "Set both CASSANDRA_USERNAME and CASSANDRA_PASSWORD, or leave both unset."
+        else:
+            try:
+                live_session = cassandra_session(
+                    tuple(config["contact_points"]), config["port"], config["keyspace"],
+                    config["username"], config["password"], config["secure_connect_bundle"],
+                )
+                st.session_state.live_storage_error = None
+            except Exception as exc:
+                st.session_state.live_storage_error = f"Could not connect to Cassandra: {exc}"
+    else:
+        st.session_state.live_storage_error = (
+            "Cassandra is not configured. Set CASSANDRA_CONTACT_POINTS (and the keyspace) "
+            "to persist live events."
+        )
 
     with st.sidebar:
         st.markdown("### Live feed settings")
@@ -599,7 +752,7 @@ def render_live_dashboard() -> None:
             key="live_refresh_seconds",
         )
         st.caption("The API may require a longer interval; the app follows its X-Poll-Interval header.")
-        if st.button("Clear this session's live events", key="clear_live_events"):
+        if st.button("Reset live session view", key="clear_live_events"):
             st.session_state.live_event_log = {}
             st.session_state.live_new_event_count = 0
             st.session_state.live_etag = None
@@ -607,6 +760,7 @@ def render_live_dashboard() -> None:
             st.session_state.live_error = None
             st.session_state.live_initialized = False
             st.rerun()
+        st.caption("Resetting the view does not delete Cassandra records.")
 
     def update_and_display() -> None:
         manual_poll = st.button("Poll now", key="poll_live_now")
@@ -632,6 +786,15 @@ def render_live_dashboard() -> None:
                     st.session_state.live_event_log = {row["id"]: row for row in ordered[:LIVE_EVENT_LIMIT]}
                     st.session_state.live_new_event_count += added
                     st.session_state.live_error = None
+                    if live_session is not None:
+                        try:
+                            persist_live_events(live_session, records)
+                            st.session_state.live_storage_error = None
+                        except Exception as exc:
+                            st.session_state.live_storage_error = (
+                                "Could not store events in Cassandra. Apply the updated `cassandra_schema.cql` "
+                                f"and check the connection. Cassandra reported: {exc}"
+                            )
                 st.session_state.live_next_poll = time.time() + max(refresh_seconds, server_interval)
                 st.session_state.live_last_checked = datetime.now().astimezone().strftime("%b %d, %Y · %H:%M:%S %Z")
             except (RuntimeError, ValueError) as exc:
@@ -639,20 +802,39 @@ def render_live_dashboard() -> None:
                 st.session_state.live_next_poll = time.time() + refresh_seconds
                 st.session_state.live_last_checked = datetime.now().astimezone().strftime("%b %d, %Y · %H:%M:%S %Z")
 
+        if live_session is not None:
+            try:
+                persisted = load_persisted_live_events(live_session)
+                log = st.session_state.live_event_log
+                for row in persisted:
+                    existing = log.get(row["id"], {})
+                    log[row["id"]] = {**row, **existing}
+                ordered = sorted(log.values(), key=lambda row: row["created_at_dt"] or datetime.min, reverse=True)
+                st.session_state.live_event_log = {row["id"]: row for row in ordered[:LIVE_EVENT_LIMIT]}
+                st.session_state.live_storage_error = None
+            except Exception as exc:
+                st.session_state.live_storage_error = (
+                    "Could not read live event history from Cassandra. Apply the updated `cassandra_schema.cql` "
+                    f"and check the connection. Cassandra reported: {exc}"
+                )
+
         last_checked = st.session_state.live_last_checked or "Waiting for first poll"
         st.caption(f"Last checked: {last_checked} · Next allowed poll follows the GitHub response header.")
         if st.session_state.live_error:
             st.error(st.session_state.live_error)
+        if st.session_state.live_storage_error:
+            st.warning(st.session_state.live_storage_error)
 
         log = list(st.session_state.live_event_log.values())
         total = len(log)
         event_counts = Counter(row["event_type"] for row in log)
         repo_count = len({row["repository"] for row in log})
         cols = st.columns(4)
-        cols[0].metric("Unique events observed", format_number(total))
+        cols[0].metric("Recent stored events", format_number(total))
         cols[1].metric("New since initial poll", format_number(st.session_state.live_new_event_count))
         cols[2].metric("Repositories", format_number(repo_count))
         cols[3].metric("Event types", format_number(len(event_counts)))
+        st.caption("The live table expires records after 30 days; this view displays up to 1,000 events from the latest 7 days.")
 
         if not log:
             st.warning("No events are available yet. Wait for the first GitHub API response or try again later.")
@@ -663,7 +845,7 @@ def render_live_dashboard() -> None:
             counts = pd.DataFrame(event_counts.most_common(), columns=["event_type", "count"])
             counts["label"] = counts["event_type"].map(format_event_name)
             chart = px.bar(counts.sort_values("count"), x="count", y="label", orientation="h",
-                           labels={"count": "Events observed in this session", "label": "Event type"},
+                           labels={"count": "Events in recent stored history", "label": "Event type"},
                            color_discrete_sequence=[COLORS["green"]])
             st.plotly_chart(chart_layout(chart, height=max(300, min(600, 28 * len(counts) + 100))),
                             width="stretch", config=PLOTLY_CONFIG)
@@ -683,7 +865,7 @@ def render_live_dashboard() -> None:
             })
             st.dataframe(display[["Time (UTC)", "Event type", "Repository", "Actor", "Details", "Event ID"]],
                          width="stretch", hide_index=True)
-            st.caption(f"Showing up to 100 of {len(filtered):,} matching events observed in this session.")
+            st.caption(f"Showing up to 100 of {len(filtered):,} matching stored events.")
 
     fragment = st.fragment(run_every=refresh_seconds if auto_update else None)
     fragment(update_and_display)()
@@ -691,292 +873,18 @@ def render_live_dashboard() -> None:
 
 def main() -> None:
     apply_theme()
-    config = cassandra_config()
-    has_cassandra_config = bool(config["contact_points"] or config["secure_connect_bundle"])
     with st.sidebar:
-        st.markdown("## ◉ GitHub Analytics")
-        st.caption("Public activity · PySpark results")
-        source_mode = st.radio(
-            "Data source",
-            ["Automatic", "Cassandra", "Local result files", "Live public events"],
-            help="Live public events polls GitHub's Events API. Automatic uses Cassandra when configured, otherwise local result files.",
-        )
-        st.markdown("### Navigate")
-        st.markdown(
-            "[Overview](#overview) · [Events](#event-type-analysis) · "
-            "[Repositories](#repository-analysis) · [Developers](#developer-analysis) · "
-            "[Daily activity](#daily-activity) · [Data quality](#data-quality-and-methodology)"
-        )
-        if st.button("↻ Refresh data", width="stretch"):
-            st.cache_data.clear()
+        st.markdown("## GitHub Public Activity")
+        st.caption("Live collector · Cassandra history")
+        if st.button("Refresh dashboard", width="stretch"):
             st.rerun()
-        st.markdown("### Dataset notes")
-        st.caption(
-            "Aggregated sample data. Date and event filters cannot be applied across repository, "
-            "developer, or heatmap results because those source files do not retain those dimensions."
-        )
-        st.caption("Zero heatmap cells indicate no matching record in this dataset sample.")
+        st.caption("Choose a tab to view saved analytics or the live GitHub feed.")
 
-    if source_mode == "Live public events":
+    overview_tab, live_tab = st.tabs(["Analytics & History", "Live Feed"])
+    with overview_tab:
+        render_persistent_dashboard()
+    with live_tab:
         render_live_dashboard()
-        return
-
-    using_cassandra = source_mode == "Cassandra" or (source_mode == "Automatic" and has_cassandra_config)
-    errors: list[str] = []
-    if using_cassandra:
-        if not has_cassandra_config:
-            errors.append(
-                "Cassandra was selected, but no connection is configured. Set `CASSANDRA_CONTACT_POINTS` "
-                "and `CASSANDRA_KEYSPACE`, or add them under `[cassandra]` in Streamlit secrets."
-            )
-        elif not config["secure_connect_bundle"] and not config["contact_points"]:
-            errors.append("Set `CASSANDRA_CONTACT_POINTS` unless you are connecting with a secure-connect bundle.")
-        elif config["port"] is None or not 1 <= config["port"] <= 65535:
-            errors.append("`CASSANDRA_PORT` must be an integer from 1 through 65535.")
-        elif bool(config["username"]) != bool(config["password"]):
-            errors.append("Set both `CASSANDRA_USERNAME` and `CASSANDRA_PASSWORD`, or leave both unset.")
-        else:
-            try:
-                summary, frames, insight_text = load_cassandra_results(
-                    tuple(config["contact_points"]),
-                    config["port"],
-                    config["keyspace"],
-                    config["username"],
-                    config["password"],
-                    config["secure_connect_bundle"],
-                )
-            except Exception as exc:
-                summary, frames, insight_text = {}, {}, ""
-                errors.append(f"Cassandra data could not be loaded: {exc}")
-        source_label = "Cassandra"
-    else:
-        summary, frames, insight_text, errors = load_file_results()
-        source_label = "Local result files"
-
-    start = summary.get("start_utc", "Not provided")
-    end = summary.get("end_utc", "Not provided")
-    with st.sidebar:
-        st.markdown("### Data window")
-        st.caption(f"Source: {source_label}")
-        st.caption(f"UTC: {start} → {end}")
-
-    if errors:
-        st.error("The selected dashboard data source needs attention. Fix the listed issue and select **Refresh data**.")
-        for error in errors:
-            st.markdown(f"- {error}")
-        return
-
-    events = normalize_counts(frames["event_types"], "event_type")
-    repositories = normalize_counts(frames["repositories"], "repository")
-    developers = normalize_counts(frames["developers"], "developer")
-
-    st.markdown('<div id="overview"></div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="hero"><div class="eyebrow">◉ Public data · PySpark analysis</div>'
-        '<h1>GitHub Public Activity Analytics</h1>'
-        '<p>Interactive analysis of actual public GitHub events using PySpark</p></div>',
-        unsafe_allow_html=True,
-    )
-    latest_mtime = max((file_version(path) for path in REQUIRED_FILES.values()), default=0)
-    refreshed = (
-        f"Cassandra · queried {datetime.now().astimezone().strftime('%H:%M %Z')}"
-        if using_cassandra
-        else (
-            datetime.fromtimestamp(latest_mtime / 1_000_000_000)
-            .astimezone()
-            .strftime("%b %d, %Y · %H:%M %Z")
-            if latest_mtime
-            else "Unavailable"
-        )
-    )
-    status_cols = st.columns([1.15, 1, 1.4])
-    status_cols[0].markdown('<span class="status-chip">● Actual public GitHub events</span>', unsafe_allow_html=True)
-    status_cols[1].markdown(f'<span class="status-chip">◷ {start} – {end} UTC</span>', unsafe_allow_html=True)
-    status_cols[2].markdown(f'<span class="status-chip">↻ Results updated {refreshed}</span>', unsafe_allow_html=True)
-
-    st.markdown("### At a glance")
-    total_events = summary.get("unique_events", events["count"].sum())
-    unique_repos = summary.get("unique_repositories", len(repositories))
-    unique_devs = summary.get("unique_developers", len(developers))
-    synthetic = summary.get("synthetic_events", 0)
-    most_common = events.iloc[0] if not events.empty else None
-    most_repo = repositories.iloc[0] if not repositories.empty else None
-    kpis = st.columns(3)
-    kpis[0].metric("📦 Total Events", format_number(total_events))
-    kpis[1].metric("🗂️ Unique Repositories", format_number(unique_repos))
-    kpis[2].metric("👥 Unique Developers", format_number(unique_devs))
-    kpis = st.columns(3)
-    kpis[0].metric("🧪 Synthetic Events", format_number(synthetic))
-    kpis[1].metric(
-        "⚡ Most Common Event Type",
-        format_event_name(most_common["event_type"]) if most_common is not None else "Not available",
-        help="Derived from the event-type aggregate table in the selected data source.",
-    )
-    kpis[2].metric(
-        "📌 Most Active Repository",
-        str(most_repo["repository"]) if most_repo is not None else "Not available",
-        help="Most frequent repository in repositories.csv.",
-    )
-
-    st.markdown('<div id="event-type-analysis"></div>', unsafe_allow_html=True)
-    st.markdown("## Event type analysis")
-    event_options = ["All event types"] + events["event_type"].astype(str).tolist()
-    selected_event = st.selectbox("Event type filter", event_options, key="event_filter")
-    event_view = events if selected_event == "All event types" else events[events["event_type"] == selected_event]
-    bars, donut = event_figures(event_view)
-    left, right = st.columns([1.15, 0.85])
-    with left:
-        st.plotly_chart(bars, width="stretch", config=PLOTLY_CONFIG)
-    with right:
-        st.plotly_chart(donut, width="stretch", config=PLOTLY_CONFIG)
-
-    top_n = st.sidebar.selectbox("Top repositories and developers", [5, 10, 15, 20], index=1)
-    st.markdown('<div id="repository-analysis"></div>', unsafe_allow_html=True)
-    st.markdown("## Repository analysis")
-    repo_view = repositories.head(top_n).copy()
-    left, right = st.columns([1.1, 0.9])
-    with left:
-        st.plotly_chart(ranked_figure(repo_view, "repository", COLORS["blue"]), width="stretch", config=PLOTLY_CONFIG)
-    with right:
-        st.dataframe(repo_view.rename(columns={"repository": "Repository", "count": "Events"}), width="stretch", hide_index=True)
-        st.download_button(
-            "⬇ Download displayed repositories",
-            repo_view.to_csv(index=False).encode("utf-8"),
-            file_name="top_repositories.csv",
-            mime="text/csv",
-            width="stretch",
-        )
-
-    st.markdown('<div id="developer-analysis"></div>', unsafe_allow_html=True)
-    st.markdown("## Developer analysis")
-    dev_view = developers.head(top_n).copy()
-    dev_view["is_bot"] = dev_view["developer"].str.contains(r"\[bot\]$", case=False, regex=True, na=False)
-    dev_view["account_type"] = dev_view["is_bot"].map({True: "Bot account", False: "Regular account"})
-    dev_view["display_name"] = dev_view.apply(
-        lambda row: f"{row['developer']} · bot" if row["is_bot"] else row["developer"], axis=1
-    )
-    left, right = st.columns([1.1, 0.9])
-    with left:
-        st.plotly_chart(ranked_figure(dev_view, "display_name", COLORS["orange"]), width="stretch", config=PLOTLY_CONFIG)
-    with right:
-        st.dataframe(
-            dev_view[["developer", "count", "account_type"]].rename(
-                columns={"developer": "Developer", "count": "Events", "account_type": "Account type"}
-            ),
-            width="stretch",
-            hide_index=True,
-        )
-        st.caption("Bot classification uses the visible `[bot]` account suffix when present.")
-        st.download_button(
-            "⬇ Download displayed developers",
-            dev_view[["developer", "count", "account_type"]].to_csv(index=False).encode("utf-8"),
-            file_name="top_developers.csv",
-            mime="text/csv",
-            width="stretch",
-        )
-
-    st.markdown('<div id="daily-activity"></div>', unsafe_allow_html=True)
-    st.markdown("## Daily activity")
-    daily = frames["daily_activity"][["date", "count"]].copy()
-    daily["date"] = pd.to_datetime(daily["date"], errors="coerce", utc=True)
-    daily["count"] = numeric_column(daily, "count")
-    daily = daily.dropna(subset=["date"]).sort_values("date")
-    if daily.empty:
-        st.warning("No valid dates were found in daily_activity.csv. Check its date column and regenerate the result file if needed.")
-    else:
-        line = px.line(daily, x="date", y="count", markers=True, labels={"date": "Date", "count": "Events in sample"})
-        line.update_traces(line_color=COLORS["green"], marker_color=COLORS["blue"], marker_size=9,
-                           hovertemplate="%{x|%Y-%m-%d}<br>Events: %{y:,}<extra></extra>")
-        line.update_xaxes(tickformat="%b %d, %Y")
-        st.plotly_chart(chart_layout(line, height=360), width="stretch", config=PLOTLY_CONFIG)
-
-    st.markdown("## Activity heatmap")
-    heat = frames["activity_heatmap"][["date", "hour", "count"]].copy()
-    heat["date"] = pd.to_datetime(heat["date"], errors="coerce", utc=True).dt.strftime("%Y-%m-%d")
-    heat["hour"] = pd.to_numeric(heat["hour"], errors="coerce")
-    heat["count"] = numeric_column(heat, "count")
-    heat = heat.dropna(subset=["date", "hour"])
-    heat = heat[heat["hour"].between(0, 23)]
-    if heat.empty:
-        st.warning("No valid date/hour combinations were found in activity_heatmap.csv.")
-    else:
-        heat["hour"] = heat["hour"].astype(int)
-        pivot = heat.pivot_table(index="date", columns="hour", values="count", aggfunc="sum")
-        pivot = pivot.reindex(index=sorted(pivot.index), columns=range(24), fill_value=0).fillna(0)
-        heatmap = go.Figure(
-            go.Heatmap(
-                z=pivot.values,
-                x=list(range(24)),
-                y=pivot.index.tolist(),
-                colorscale=[[0, "#161b22"], [0.35, "#1f6feb"], [0.7, "#2da44e"], [1, "#d29922"]],
-                colorbar={"title": "Events", "tickfont": {"color": COLORS["text"]}},
-                hovertemplate="Date: %{y}<br>Hour: %{x}:00 UTC<br>Events in sample: %{z:,}<extra></extra>",
-                zmin=0,
-            )
-        )
-        heatmap.update_xaxes(title="Hour of day (UTC)", tickmode="array", tickvals=list(range(24)), ticktext=[f"{hour:02d}" for hour in range(24)])
-        heatmap.update_yaxes(title="Date")
-        st.plotly_chart(chart_layout(heatmap, height=max(300, min(520, 45 * len(pivot.index) + 140))), width="stretch", config=PLOTLY_CONFIG)
-        st.caption("Empty cells are zero records in this collected sample; they do not mean there was no activity globally.")
-
-    st.markdown("## Insights")
-    groups = split_insights(insight_text)
-    a, b, c = st.columns(3)
-    for column, name, icon in [(a, "Main findings", "🔎"), (b, "Recommendations", "🧭"), (c, "Limitations", "ⓘ")]:
-        with column:
-            show_insight_group(name, groups.get(name, []), icon)
-
-    st.markdown('<div id="data-quality-and-methodology"></div>', unsafe_allow_html=True)
-    with st.expander("Data Quality and Methodology", expanded=False):
-        quality = [
-            ("Number of input records", summary.get("input_records")),
-            ("Number of unique events", summary.get("unique_events")),
-            ("Number of repositories", summary.get("unique_repositories")),
-            ("Number of developers", summary.get("unique_developers")),
-            ("Spark version", summary.get("spark_version")),
-            ("Data start time (UTC)", summary.get("start_utc")),
-            ("Data end time (UTC)", summary.get("end_utc")),
-            ("Synthetic events used", "Yes" if pd.to_numeric(pd.Series([summary.get("synthetic_events")]), errors="coerce").fillna(0).iloc[0] > 0 else ("No" if "synthetic_events" in summary else "Not provided")),
-            ("Source filter", summary.get("source_filter")),
-        ]
-        quality_cols = st.columns(3)
-        for index, (label, value) in enumerate(quality):
-            quality_cols[index % 3].metric(label, format_number(value) if isinstance(value, (int, float)) else (str(value) if value not in (None, "") else "Not provided"))
-        st.caption("All values above are read from summary.json. Activity describes only the collected input sample.")
-
-    st.markdown("## Download result files")
-    download_cols = st.columns(3)
-    downloads = [
-        ("event_types", "event_types.csv", "text/csv"),
-        ("repositories", "repositories.csv", "text/csv"),
-        ("developers", "developers.csv", "text/csv"),
-        ("daily_activity", "daily_activity.csv", "text/csv"),
-        ("activity_heatmap", "activity_heatmap.csv", "text/csv"),
-        ("summary", "summary.json", "application/json"),
-    ]
-    for index, (key, filename, mime) in enumerate(downloads):
-        if key == "summary":
-            payload = json.dumps(summary, indent=2, ensure_ascii=False).encode("utf-8")
-        else:
-            payload = frames[key].to_csv(index=False).encode("utf-8")
-        with download_cols[index % 3]:
-            st.download_button(f"⬇ {filename}", payload, file_name=filename, mime=mime, width="stretch", key=f"download_{key}")
-
-    st.markdown("## Export for Power BI")
-    st.markdown(
-        f"Download the current {source_label} result tables together in one package. "
-        "Import the CSVs into Power BI Desktop, then save your report as a `.pbix` file."
-    )
-    st.download_button(
-        "⬇ Download Power BI import package (.zip)",
-        data=build_powerbi_package(summary, frames, insight_text),
-        file_name="github_public_activity_powerbi.zip",
-        mime="application/zip",
-        width="stretch",
-        key="download_powerbi_package",
-    )
-
-    st.caption(f"Data source: {source_label}. PySpark analysis outputs are displayed as supplied; no analytics are recomputed in the dashboard.")
 
 
 if __name__ == "__main__":

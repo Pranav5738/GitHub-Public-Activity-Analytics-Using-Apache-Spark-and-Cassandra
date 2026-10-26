@@ -1,0 +1,24 @@
+cd "D:\SEM 7\FA2 BDA REAL DATA"
+
+.\.venv\Scripts\Activate.ps1
+
+$env:CASSANDRA_CONTACT_POINTS = "127.0.0.1"
+$env:CASSANDRA_PORT = "9042"
+$env:CASSANDRA_KEYSPACE = "github_analytics"
+
+python -m streamlit run app.py
+
+cd "D:\SEM 7\FA2 BDA REAL DATA"
+
+.\.venv\Scripts\Activate.ps1
+
+docker start cassandra
+
+docker cp .\cassandra_schema.cql cassandra:/tmp/cassandra_schema.cql
+docker exec cassandra cqlsh -f /tmp/cassandra_schema.cql
+
+$env:CASSANDRA_CONTACT_POINTS = "127.0.0.1"
+$env:CASSANDRA_PORT = "9042"
+$env:CASSANDRA_KEYSPACE = "github_analytics"
+
+python live_collector.py
